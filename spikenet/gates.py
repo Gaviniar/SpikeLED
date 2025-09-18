@@ -1,4 +1,5 @@
 # File: spikenet/gates.py
+
 import torch
 import torch.nn as nn
 
@@ -11,16 +12,15 @@ class L2SGate(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         self.base_p = base_p
-        # 每层一组 (w, b)
         self.w = nn.Parameter(torch.zeros(num_layers, in_features))
         self.b = nn.Parameter(torch.zeros(num_layers))
 
     @torch.no_grad()
     def forward(self, stats_t: torch.Tensor) -> torch.Tensor:
-        # stats_t: [F]（建议放 CPU/GPU 均可，这里不求梯度）
-        z = stats_t.float().view(-1)  # [F]
-        logits = torch.mv(self.w, z) + self.b  # [L]
-        p = torch.sigmoid(logits)              # (0,1)
-        # 与 base_p 做一个温和融合，避免训练前期剧烈波动
-        p = 0.5 * p + 0.5 * torch.as_tensor(self.base_p).to(p)
+        # ⚠️ 关键修复：把输入统计量搬到参数所在设备/精度
+        z = stats_t.detach().to(self.w.device, dtype=self.w.dtype).view(-1)  # [F]
+        logits = torch.mv(self.w, z) + self.b                               # [L]
+        p = torch.sigmoid(logits)                                           # (0,1)
+        base = torch.as_tensor(self.base_p, dtype=p.dtype, device=p.device)
+        p = 0.5 * p + 0.5 * base                                            # 温和融合
         return p  # [L]
