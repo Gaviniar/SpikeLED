@@ -30,10 +30,13 @@ class GroupSparseDelay1D(nn.Module):
         if init == 'gaussian_like':
             # 按高斯样式初始化，靠近温和扩散
             with torch.no_grad():
+                max_delay = max(self.delays)
                 for i, delay in enumerate(self.delays):
-                    # 基于延迟距离的衰减权重
-                    decay = torch.exp(-0.5 * (delay / max(self.delays)) ** 2)
-                    self.weight[:, i].fill_(decay.item() * 0.1)
+                    # 基于延迟距离的衰减权重 - 修复：确保计算结果是标量
+                    decay_value = (-0.5 * (delay / max_delay) ** 2)
+                    decay = float(torch.exp(torch.tensor(decay_value)).item())
+                    self.weight[:, i].fill_(decay * 0.1)
+
 
     @torch.no_grad()
     def _stability_projection(self):
