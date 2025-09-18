@@ -244,7 +244,6 @@ def build_model_from_trial(trial, in_features, out_features):
     # 每层采样邻居数
     sizes = []
     for i in range(n_layers):
-        # 第一层邻居通常大一些，第二层小一些
         if i == 0:
             sizes.append(trial.suggest_int(f"size_l{i}", 4, 15))
         else:
@@ -258,33 +257,34 @@ def build_model_from_trial(trial, in_features, out_features):
 
     # 其它超参
     dropout = trial.suggest_float("dropout", 0.3, 0.8)
-    lr = trial.suggest_float("lr", 1e-4, 5e-2, log=True)
+    lr = trial.suggest_float("lr", 1e-5, 5e-2, log=True)
     alpha = trial.suggest_float("alpha", 0.5, 2.0)
     alpha_warmup = trial.suggest_float("alpha_warmup", 0.2, 0.5)
     p = trial.suggest_float("p_base", 0.6, 0.95)
 
-    sampler = trial.suggest_categorical("sampler", ["sage", "rw"])
-    aggr = trial.suggest_categorical("aggr", ["mean", "sum"])
-    surrogate = trial.suggest_categorical("surrogate", ["sigmoid", "triangle", "arctan", "mg", "super"])
-    neuron_type = trial.suggest_categorical("neuron", ["IF", "LIF", "PLIF"])
-    concat = trial.suggest_categorical("concat", [False, True])
+    sampler = trial.suggest_categorical("sampler", ("sage", "rw"))
+    aggr = trial.suggest_categorical("aggr", ("mean", "sum"))
+    surrogate = trial.suggest_categorical("surrogate", ("sigmoid", "triangle", "arctan", "mg", "super"))
+    neuron_type = trial.suggest_categorical("neuron", ("IF", "LIF", "PLIF"))
+    concat = trial.suggest_categorical("concat", (False, True))
 
-    use_learnable_p = trial.suggest_categorical("use_learnable_p", [True, False])
-    use_gs_delay = trial.suggest_categorical("use_gs_delay", [True, False])
-    use_tsr = trial.suggest_categorical("use_tsr", [True, False])
+    use_learnable_p = trial.suggest_categorical("use_learnable_p", (True, False))
+    use_gs_delay = trial.suggest_categorical("use_gs_delay", (True, False))
+    use_tsr = trial.suggest_categorical("use_tsr", (True, False))
 
-    # Delay 相关
+    # Delay 相关（choices 一律 tuple，避免 Dashboard 哈希报错）
     delay_groups = trial.suggest_int("delay_groups", 4, 16) if use_gs_delay else 8
-    delays_choice = trial.suggest_categorical("delays",
-                                              [(0, 1, 2), (0, 1, 3, 5), (1, 3, 5)]) if use_gs_delay else (1, 3, 5)
+    delays_choice = trial.suggest_categorical(
+        "delays",
+        ((0, 1, 2), (0, 1, 3, 5), (1, 3, 5))
+    ) if use_gs_delay else (1, 3, 5)
 
     # 正则相关
-    spike_reg = trial.suggest_categorical("spike_reg", [0.0, 1e-5, 1e-4, 5e-4, 1e-3])
-    temp_reg = trial.suggest_categorical("temp_reg", [0.0, 1e-6, 5e-6, 1e-5, 5e-5])
+    spike_reg = trial.suggest_categorical("spike_reg", (0.0, 1e-5, 1e-4, 5e-4, 1e-3))
+    temp_reg = trial.suggest_categorical("temp_reg", (0.0, 1e-6, 5e-6, 1e-5, 5e-5))
 
     batch_size = 1024
-    # trial.suggest_categorical("batch_size", [512, 1024, 2048])
-
+    # trial.suggest_categorical("batch_size", (512, 1024, 2048))
 
     model = SpikeNet(in_features, out_features,
                      hids=hids, alpha=alpha, p=p,
@@ -292,6 +292,12 @@ def build_model_from_trial(trial, in_features, out_features):
                      surrogate=surrogate, sizes=sizes, concat=concat, act=neuron_type,
                      use_gs_delay=use_gs_delay, delay_groups=delay_groups, delay_set=delays_choice,
                      use_learnable_p=use_learnable_p, use_tsr=use_tsr).to(device)
+
+    # 可选：把条件开关记到面板（不影响优化）
+    trial.set_user_attr("gs_delay_enabled", bool(use_gs_delay))
+    if use_gs_delay:
+        trial.set_user_attr("delay_groups", int(delay_groups))
+        trial.set_user_attr("delays", tuple(delays_choice))
 
     cfg = dict(lr=lr, alpha=alpha, alpha_warmup=alpha_warmup,
                spike_reg=spike_reg, temp_reg=temp_reg, batch_size=batch_size)
@@ -304,17 +310,13 @@ def objective_factory(args):
 
     def objective(trial: optuna.trial.Trial):
         set_seed(args.seed + trial.number)
-        train_loader, val_loader, test_loader = None, None, None
 
         model, cfg = build_model_from_trial(trial, data.num_features, data.num_classes)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"])
         loss_fn = nn.CrossEntropyLoss()
 
+        # 局部 loader（不需要 nonlocal）
         train_loader, val_loader, test_loader = make_loaders(cfg["batch_size"])
-
-        best_val_micro = -1.0
-        best_test_macro = 0.0
-        best_test_micro = 0.0
 
         best_val_micro = -1.0
         best_test_macro = 0.0
