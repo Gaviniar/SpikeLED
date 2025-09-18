@@ -218,11 +218,11 @@ except:
 assert len(args.hids) == len(args.sizes), "must be equal!"
 
 if args.dataset.lower() == "dblp":
-    data = dataset.DBLP()
+    data = dataset.DBLP(root='/data4/zhengzhuoyu/data')
 elif args.dataset.lower() == "tmall":
-    data = dataset.Tmall()
+    data = dataset.Tmall(root='/data4/zhengzhuoyu/data')
 elif args.dataset.lower() == "patent":
-    data = dataset.Patent()
+    data = dataset.Patent(root='/data4/zhengzhuoyu/data')
 else:
     raise ValueError(
         f"{args.dataset} is invalid. Only datasets (dblp, tmall, patent) are available.")
