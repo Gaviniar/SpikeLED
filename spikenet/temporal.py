@@ -10,9 +10,16 @@ class GroupSparseDelay1D(nn.Module):
     """
     def __init__(self, D, T, groups=8, delays=(1, 3, 5), init='gaussian_like'):
         super().__init__()
-        assert D % groups == 0, f"D ({D}) must be divisible by groups ({groups})"
+        
+        # 自适应调整 groups 数量，确保能被 D 整除
+        while D % groups != 0 and groups > 1:
+            groups -= 1
+        groups = max(groups, 1)  # 至少为1
+        
         self.D, self.T, self.G = D, T, groups
         self.delays = list(delays)
+        
+        print(f"GroupSparseDelay1D: D={D}, T={T}, groups={groups} (adjusted)")
         
         # 每组对每个 delay 一个权重（标量），共享到组内所有通道
         self.weight = nn.Parameter(torch.zeros(self.G, len(self.delays)))
@@ -40,6 +47,11 @@ class GroupSparseDelay1D(nn.Module):
     def forward(self, x):
         # x: [B, T, D]
         B, T, D = x.shape
+        
+        # 如果 groups=1，直接处理整个 D 维度
+        if self.G == 1:
+            return self._forward_single_group(x)
+        
         gC = D // self.G
         
         # Reshape to group dimension: [B, G, T, gC]
@@ -70,6 +82,35 @@ class GroupSparseDelay1D(nn.Module):
         # Reshape back: [B, T, D]
         output = output.permute(0, 2, 1, 3).contiguous().view(B, T, D)
         return output
+    
+    def _forward_single_group(self, x):
+        """当只有一个组时的简化处理"""
+        B, T, D = x.shape
+        
+        # 应用稳定性投影
+        if self.training:
+            self._stability_projection()
+        
+        # Softmax归一化权重
+        W = self.weight.softmax(dim=-1).squeeze(0)  # [K]
+        
+        # 计算延迟后的加权和
+        output = torch.zeros_like(x)  # [B, T, D]
+        
+        for i, delay in enumerate(self.delays):
+            if delay == 0:
+                delayed_x = x
+            else:
+                # 向右延迟 delay 步
+                delayed_x = torch.zeros_like(x)
+                if delay < T:
+                    delayed_x[:, delay:, :] = x[:, :-delay, :]
+            
+            # 按权重累加
+            output += W[i] * delayed_x
+        
+        return output
+
 
 
 class TemporalSeparableReadout(nn.Module):
