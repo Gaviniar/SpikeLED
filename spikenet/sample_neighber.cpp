@@ -1,5 +1,6 @@
+// File: spikenet/sample_neighber.cpp
 #include <torch/extension.h>
-#include <random>
+#include <unordered_set>  // 新增：原文件使用了 unordered_set，但未包含头文件
 #define CHECK_CPU(x) AT_ASSERTM(x.device().is_cpu(), #x " must be CPU tensor")
 #define CHECK_INPUT(x) AT_ASSERTM(x, "Input mismatch")
 
@@ -20,7 +21,7 @@
 torch::Tensor sample_neighber_cpu(torch::Tensor rowptr, torch::Tensor col, torch::Tensor idx,
                int64_t num_neighbors, bool replace);
 
-// Returns sampled neighbor indices
+// Returns `n_id`
 torch::Tensor sample_neighber_cpu(torch::Tensor rowptr, torch::Tensor col, torch::Tensor idx,
                int64_t num_neighbors, bool replace)
 {
@@ -34,19 +35,16 @@ torch::Tensor sample_neighber_cpu(torch::Tensor rowptr, torch::Tensor col, torch
     auto idx_data = idx.data_ptr<int64_t>();
 
     std::vector<int64_t> n_ids;
-    std::random_device rd;
-    std::mt19937 gen(rd());
 
     int64_t n, c, e, row_start, row_end, row_count;
 
     if (num_neighbors < 0)
-    { // No sampling ======================================
+    {   // No sampling
         for (int64_t i = 0; i < idx.numel(); i++)
         {
             n = idx_data[i];
-            row_start = rowptr_data[n], row_end = rowptr_data[n + 1];
+            row_start = rowptr_data[n]; row_end = rowptr_data[n + 1];
             row_count = row_end - row_start;
-
             for (int64_t j = 0; j < row_count; j++)
             {
                 e = row_start + j;
@@ -56,51 +54,41 @@ torch::Tensor sample_neighber_cpu(torch::Tensor rowptr, torch::Tensor col, torch
         }
     }
     else if (replace)
-    { // Sample with replacement (真正的有放回采样) ===============================
+    {   // True sampling WITH replacement: 每次独立均匀抽取一个邻居
         for (int64_t i = 0; i < idx.numel(); i++)
         {
             n = idx_data[i];
-            row_start = rowptr_data[n], row_end = rowptr_data[n + 1];
+            row_start = rowptr_data[n]; row_end = rowptr_data[n + 1];
             row_count = row_end - row_start;
-
-            if (row_count == 0) continue; // Skip nodes with no neighbors
-
-            std::uniform_int_distribution<int64_t> dis(0, row_count - 1);
-            
+            if (row_count <= 0) continue; // 理论上 add_selfloops 后不会发生
             for (int64_t j = 0; j < num_neighbors; j++)
             {
-                int64_t rand_idx = dis(gen);
-                e = row_start + rand_idx;
+                e = row_start + (std::rand() % row_count);
                 c = col_data[e];
                 n_ids.push_back(c);
             }
         }
     }
     else
-    { // Sample without replacement via Robert Floyd algorithm ============
+    {   // Sample WITHOUT replacement via Robert Floyd algorithm
         for (int64_t i = 0; i < idx.numel(); i++)
         {
             n = idx_data[i];
-            row_start = rowptr_data[n], row_end = rowptr_data[n + 1];
+            row_start = rowptr_data[n]; row_end = rowptr_data[n + 1];
             row_count = row_end - row_start;
 
             std::unordered_set<int64_t> perm;
             if (row_count <= num_neighbors)
             {
-                for (int64_t j = 0; j < row_count; j++)
-                    perm.insert(j);
+                for (int64_t j = 0; j < row_count; j++) perm.insert(j);
             }
             else
-            { // Robert Floyd algorithm
-                std::uniform_int_distribution<int64_t> dis(0, row_count - 1);
+            {
                 for (int64_t j = row_count - num_neighbors; j < row_count; j++)
                 {
-                    int64_t rand_val = std::uniform_int_distribution<int64_t>(0, j)(gen);
-                    if (!perm.insert(rand_val).second)
-                        perm.insert(j);
+                    if (!perm.insert(std::rand() % j).second) perm.insert(j);
                 }
             }
-
             for (const int64_t &p : perm)
             {
                 e = row_start + p;
@@ -110,11 +98,10 @@ torch::Tensor sample_neighber_cpu(torch::Tensor rowptr, torch::Tensor col, torch
         }
     }
 
-    int64_t N = n_ids.size();
-    auto out_n_id = torch.from_blob(n_ids.data(), {N}, col.options()).clone();
+    int64_t N = (int64_t)n_ids.size();
+    auto out_n_id = torch::from_blob(n_ids.data(), {N}, col.options()).clone();
     return out_n_id;
 }
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.def("sample_neighber_cpu", &sample_neighber_cpu, "Node neighborhood sampler");
 }

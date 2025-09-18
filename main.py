@@ -1,3 +1,4 @@
+# File: main.py
 import argparse
 import time
 
@@ -9,10 +10,10 @@ from tqdm import tqdm
 
 from spikenet import dataset, neuron
 from spikenet.layers import SAGEAggregator
-from spikenet.temporal import GroupSparseDelay1D, TemporalSeparableReadout, compute_temporal_stats
-from spikenet.gates import L2SGate
 from spikenet.utils import (RandomWalkSampler, Sampler, add_selfloops,
                             set_seed, tab_printer)
+from spikenet.temporal import GroupSparseDelay1D, TemporalSeparableReadout
+from spikenet.gates import L2SGate
 
 
 class SpikeNet(nn.Module):
@@ -20,7 +21,7 @@ class SpikeNet(nn.Module):
                  dropout=0.7, bias=True, aggr='mean', sampler='sage',
                  surrogate='triangle', sizes=[5, 2], concat=False, act='LIF',
                  use_gs_delay=True, delay_groups=8, delay_set=(1, 3, 5),
-                 use_learnable_p=True, use_tsr=True, learnable_threshold=False):
+                 use_learnable_p=True, use_tsr=True):
 
         super().__init__()
 
@@ -40,113 +41,132 @@ class SpikeNet(nn.Module):
 
         aggregators, snn = nn.ModuleList(), nn.ModuleList()
 
+        in_dim = in_features
         for hid in hids:
-            aggregators.append(SAGEAggregator(in_features, hid,
+            aggregators.append(SAGEAggregator(in_dim, hid,
                                               concat=concat, bias=bias,
                                               aggr=aggr))
 
             if act == "IF":
-                snn.append(neuron.IF(alpha=alpha, surrogate=surrogate, 
-                                   learnable_threshold=learnable_threshold))
+                snn.append(neuron.IF(alpha=alpha, surrogate=surrogate))
             elif act == 'LIF':
-                snn.append(neuron.LIF(tau, alpha=alpha, surrogate=surrogate,
-                                    learnable_threshold=learnable_threshold))
+                snn.append(neuron.LIF(tau, alpha=alpha, surrogate=surrogate))
             elif act == 'PLIF':
-                snn.append(neuron.PLIF(tau, alpha=alpha, surrogate=surrogate,
-                                     learnable_threshold=learnable_threshold))
+                snn.append(neuron.PLIF(tau, alpha=alpha, surrogate=surrogate))
             else:
                 raise ValueError(act)
 
-            in_features = hid * 2 if concat else hid
+            in_dim = hid * 2 if concat else hid
 
         self.aggregators = aggregators
         self.dropout = nn.Dropout(dropout)
         self.snn = snn
         self.sizes = sizes
-        self.p = p
+        self.base_p = p
         self.use_gs_delay = use_gs_delay
         self.use_tsr = use_tsr
         self.use_learnable_p = use_learnable_p
 
-        # 可学习采样门
-        if self.use_learnable_p:
-            self.p_gate = L2SGate(input_dim=3)
+        # 时间统计（不参与梯度）：新增边占比、平均度
+        with torch.no_grad():
+            stats = []
+            for t in range(len(data)):
+                # edges: 累计；edges_evolve: 当期新增
+                e_now = data.edges_evolve[t].shape[1]
+                e_cum = data.edges[t].size(1)
+                r_new = float(e_now) / max(1.0, float(e_cum))
+                deg_mean = 2.0 * float(e_cum) / float(data.num_nodes)
+                stats.append([r_new, deg_mean])
+            self.time_stats = torch.tensor(stats, dtype=torch.float32)
 
-        # 延迟核
-        T = len(data)
-        last_dim = in_features
+        # 可学习 p 门（每层一个标量，输入 F=2）
+        if self.use_learnable_p:
+            self.gate = L2SGate(num_layers=len(self.sizes), in_features=2, base_p=self.base_p)
+
+        last_dim = in_dim  # 经过所有聚合后 root 节点的维度
+        T = len(data)      # 时间步
         if self.use_gs_delay:
             self.delay = GroupSparseDelay1D(D=last_dim, T=T, groups=delay_groups, delays=delay_set)
 
-        # 读出层
         if self.use_tsr:
             self.readout = TemporalSeparableReadout(D=last_dim, C=out_features, k=5)
         else:
-            self.pooling = nn.Linear(len(data) * in_features, out_features)
+            self.pooling = nn.Linear(T * last_dim, out_features)
 
-        # 用于存储最后一次的spikes用于计算正则项
+        # 供正则使用的缓存
         self._last_spikes_for_loss = None
 
-    def encode(self, nodes):
-        spikes = []
-        sizes = self.sizes
-        for time_step in range(len(data)):
-            snapshot = data[time_step]
-            sampler = self.sampler[time_step]
-            sampler_t = self.sampler_t[time_step]
+    def _layer_forward(self, h_list, sizes):
+        """单时间步上的 SAGE+SNN 堆叠（沿用原有实现）。"""
+        for i, aggregator in enumerate(self.aggregators):
+            self_x = h_list[:-1]
+            neigh_x = []
+            for j, n_x in enumerate(h_list[1:]):
+                neigh_x.append(n_x.view(-1, sizes[j], h_list[0].size(-1)))
+            out = self.snn[i](aggregator(self_x, neigh_x))
+            if i != len(sizes) - 1:
+                out = self.dropout(out)
+                # 更新到下一层的多跳特征切片
+                # num_nodes 在外层维护，这里由调用方传入切分信息
+            h_list = None  # 防止误用
+        return out
 
-            # 可学习采样门
-            if self.use_learnable_p:
-                temporal_stats = compute_temporal_stats(data.adj, time_step)
-                p_t = self.p_gate(temporal_stats.to(device)).item()
-            else:
-                p_t = self.p
+    def encode(self, nodes: torch.Tensor):
+        spikes_per_t = []
+        sizes = self.sizes
+        for t in range(len(data)):
+            snapshot = data[t]
+            sampler = self.sampler[t]
+            sampler_t = self.sampler_t[t]
 
             x = snapshot.x
             h = [x[nodes].to(device)]
             num_nodes = [nodes.size(0)]
             nbr = nodes
-            for size in sizes:
-                size_1 = max(int(size * p_t), 1)
-                size_2 = size - size_1
 
+            # 每层的 p_{l,t}
+            if self.use_learnable_p:
+                p_vec = self.gate(self.time_stats[t]).cpu().tolist()  # [L]
+            else:
+                p_vec = [self.base_p for _ in sizes]
+
+            # 逐层扩展采样邻居
+            for li, size in enumerate(sizes):
+                p_now = float(p_vec[li])
+                size_1 = max(int(size * p_now), 1)
+                size_2 = size - size_1
                 if size_2 > 0:
                     nbr_1 = sampler(nbr, size_1).view(nbr.size(0), size_1)
                     nbr_2 = sampler_t(nbr, size_2).view(nbr.size(0), size_2)
                     nbr = torch.cat([nbr_1, nbr_2], dim=1).flatten()
                 else:
                     nbr = sampler(nbr, size_1).view(-1)
-
                 num_nodes.append(nbr.size(0))
                 h.append(x[nbr].to(device))
 
+            # SAGE + SNN 堆叠
             for i, aggregator in enumerate(self.aggregators):
                 self_x = h[:-1]
                 neigh_x = []
                 for j, n_x in enumerate(h[1:]):
                     neigh_x.append(n_x.view(-1, sizes[j], h[0].size(-1)))
-
                 out = self.snn[i](aggregator(self_x, neigh_x))
                 if i != len(sizes) - 1:
                     out = self.dropout(out)
                     h = torch.split(out, num_nodes[:-(i + 1)])
 
-            spikes.append(out)
+            spikes_per_t.append(out)  # [N, D]
 
-        spikes = torch.stack(spikes, dim=1)  # [B, T, D]
-        
-        # 应用延迟核
+        # [N, T, D]
+        spikes = torch.stack(spikes_per_t, dim=1)
         if self.use_gs_delay:
             spikes = self.delay(spikes)
-            
-        # 存储用于正则项计算
-        self._last_spikes_for_loss = spikes.detach()
-        
+        self._last_spikes_for_loss = spikes
         neuron.reset_net(self)
         return spikes
 
     def forward(self, nodes):
-        spikes = self.encode(nodes)
+        spikes = self.encode(nodes)  # [B, T, D]
         if self.use_tsr:
             return self.readout(spikes)
         else:
@@ -156,8 +176,7 @@ class SpikeNet(nn.Module):
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", nargs="?", default="DBLP",
                     help="Datasets (DBLP, Tmall, Patent). (default: DBLP)")
-parser.add_argument('--sizes', type=int, nargs='+', default=[5, 2], 
-                    help='Neighborhood sampling size for each layer. (default: [5, 2])')
+parser.add_argument('--sizes', type=int, nargs='+', default=[5, 2], help='Neighborhood sampling size for each layer. (default: [5, 2])')
 parser.add_argument('--hids', type=int, nargs='+',
                     default=[128, 10], help='Hidden units for each layer. (default: [128, 10])')
 parser.add_argument("--aggr", nargs="?", default="mean",
@@ -186,23 +205,16 @@ parser.add_argument('--concat', action='store_true',
                     help='Whether to concat node representation and neighborhood representations. (default: False)')
 parser.add_argument('--seed', type=int, default=2022,
                     help='Random seed for model. (default: 2022)')
-# 新增的参数
-parser.add_argument('--use_gs_delay', action='store_true', default=True,
-                    help='Whether to use group sparse delay kernel. (default: True)')
-parser.add_argument('--use_tsr', action='store_true', default=True,
-                    help='Whether to use temporal separable readout. (default: True)')
-parser.add_argument('--use_learnable_p', action='store_true', default=True,
-                    help='Whether to use learnable sampling gate. (default: True)')
-parser.add_argument('--learnable_threshold', action='store_true', default=False,
-                    help='Whether to use learnable threshold parameters. (default: False)')
-parser.add_argument('--delay_groups', type=int, default=8,
-                    help='Number of groups for delay kernel. (default: 8)')
-parser.add_argument('--lambda_spike', type=float, default=1e-4,
-                    help='Regularization weight for spike rate. (default: 1e-4)')
-parser.add_argument('--lambda_temp', type=float, default=1e-4,
-                    help='Regularization weight for temporal consistency. (default: 1e-4)')
-parser.add_argument('--alpha_warmup', action='store_true', default=False,
-                    help='Whether to use alpha warmup. (default: False)')
+# 新增功能开关
+parser.add_argument('--use_gs_delay', type=int, default=1, help='Use Group-Sparse Delay kernel (1|0).')
+parser.add_argument('--delay_groups', type=int, default=8, help='Delay groups for GS-Delay.')
+parser.add_argument('--delays', type=int, nargs='+', default=[1,3,5], help='Sparse delay set Δ.')
+parser.add_argument('--use_tsr', type=int, default=1, help='Use Temporal Separable Readout (1|0).')
+parser.add_argument('--use_learnable_p', type=int, default=1, help='Use learnable sampling gate (1|0).')
+# 正则与课程
+parser.add_argument('--spike_reg', type=float, default=0.0, help='Avg firing-rate regularization λ.')
+parser.add_argument('--temp_reg', type=float, default=0.0, help='Temporal consistency regularization λ.')
+parser.add_argument('--alpha_warmup', type=float, default=0.3, help='Warm-up ratio of epochs for surrogate alpha (0~1).')
 
 try:
     args = parser.parse_args()
@@ -218,11 +230,11 @@ except:
 assert len(args.hids) == len(args.sizes), "must be equal!"
 
 if args.dataset.lower() == "dblp":
-    data = dataset.DBLP(root='/data4/zhengzhuoyu/data')
+    data = dataset.DBLP()
 elif args.dataset.lower() == "tmall":
-    data = dataset.Tmall(root='/data4/zhengzhuoyu/data')
+    data = dataset.Tmall()
 elif args.dataset.lower() == "patent":
-    data = dataset.Patent(root='/data4/zhengzhuoyu/data')
+    data = dataset.Patent()
 else:
     raise ValueError(
         f"{args.dataset} is invalid. Only datasets (dblp, tmall, patent) are available.")
@@ -246,66 +258,45 @@ model = SpikeNet(data.num_features, data.num_classes, alpha=args.alpha,
                  dropout=args.dropout, sampler=args.sampler, p=args.p,
                  aggr=args.aggr, concat=args.concat, sizes=args.sizes, surrogate=args.surrogate,
                  hids=args.hids, act=args.neuron, bias=True,
-                 use_gs_delay=args.use_gs_delay, delay_groups=args.delay_groups,
-                 use_tsr=args.use_tsr, use_learnable_p=args.use_learnable_p,
-                 learnable_threshold=args.learnable_threshold).to(device)
+                 use_gs_delay=bool(args.use_gs_delay), delay_groups=args.delay_groups,
+                 delay_set=tuple(args.delays), use_learnable_p=bool(args.use_learnable_p),
+                 use_tsr=bool(args.use_tsr)).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 loss_fn = nn.CrossEntropyLoss()
 
-# Alpha warmup scheduler
-def get_current_alpha(epoch, total_epochs, base_alpha, warmup_ratio=0.3):
-    if not args.alpha_warmup:
-        return base_alpha
-    warmup_epochs = int(total_epochs * warmup_ratio)
-    if epoch < warmup_epochs:
-        return base_alpha * (epoch / warmup_epochs)
-    return base_alpha
+
+def set_alpha_with_warmup(net: nn.Module, base_alpha: float, epoch: int, total_epochs: int, warmup_ratio: float):
+    if warmup_ratio <= 0:
+        cur_alpha = base_alpha
+    else:
+        warm_epochs = max(1, int(total_epochs * warmup_ratio))
+        factor = min(1.0, float(epoch) / float(warm_epochs))
+        cur_alpha = max(1e-3, base_alpha * factor)
+    # 将 alpha 写入所有神经元模块
+    for m in net.modules():
+        if hasattr(m, 'alpha') and isinstance(m.alpha, torch.Tensor):
+            m.alpha.data.fill_(cur_alpha)
+
 
 def train():
     model.train()
-    total_loss = 0
-    total_ce_loss = 0
-    total_spike_reg = 0
-    total_temp_reg = 0
-    
     for nodes in tqdm(train_loader, desc='Training'):
         optimizer.zero_grad()
         logits = model(nodes)
-        ce_loss = loss_fn(logits, y[nodes])
-        
-        # 正则项计算
-        reg_spike = 0
-        reg_temp = 0
-        
-        if model._last_spikes_for_loss is not None:
-            spikes = model._last_spikes_for_loss  # [B, T, D]
-            
-            # 平均放电率正则
-            reg_spike = spikes.mean()
-            
-            # 时间一致性正则
-            if spikes.size(1) > 1:  # T > 1
+        ce = loss_fn(logits, y[nodes])
+        loss = ce
+        # 正则项
+        spikes = model._last_spikes_for_loss
+        if spikes is not None:
+            if args.spike_reg > 0:
+                reg_spike = spikes.mean()
+                loss = loss + args.spike_reg * reg_spike
+            if args.temp_reg > 0 and spikes.size(1) > 1:
                 reg_temp = (spikes[:, 1:] - spikes[:, :-1]).pow(2).mean()
-        
-        # 总损失
-        loss = ce_loss + args.lambda_spike * reg_spike + args.lambda_temp * reg_temp
-        
+                loss = loss + args.temp_reg * reg_temp
         loss.backward()
         optimizer.step()
-        
-        # 统计
-        total_loss += loss.item()
-        total_ce_loss += ce_loss.item()
-        total_spike_reg += reg_spike.item() if isinstance(reg_spike, torch.Tensor) else reg_spike
-        total_temp_reg += reg_temp.item() if isinstance(reg_temp, torch.Tensor) else reg_temp
-    
-    return {
-        'total_loss': total_loss / len(train_loader),
-        'ce_loss': total_ce_loss / len(train_loader),
-        'spike_reg': total_spike_reg / len(train_loader),
-        'temp_reg': total_temp_reg / len(train_loader)
-    }
 
 
 @torch.no_grad()
@@ -318,23 +309,18 @@ def test(loader):
         labels.append(y[nodes])
     logits = torch.cat(logits, dim=0).cpu()
     labels = torch.cat(labels, dim=0).cpu()
-    logits = logits.argmax(1)
-    metric_macro = metrics.f1_score(labels, logits, average='macro')
-    metric_micro = metrics.f1_score(labels, logits, average='micro')
+    preds = logits.argmax(1)
+    metric_macro = metrics.f1_score(labels, preds, average='macro')
+    metric_micro = metrics.f1_score(labels, preds, average='micro')
     return metric_macro, metric_micro
 
 
 best_val_metric = test_metric = 0
 start = time.time()
 for epoch in range(1, args.epochs + 1):
-    # Alpha warmup
-    if args.alpha_warmup:
-        current_alpha = get_current_alpha(epoch, args.epochs, args.alpha)
-        for module in model.modules():
-            if hasattr(module, 'alpha'):
-                module.alpha.fill_(current_alpha)
-    
-    train_stats = train()
+    # surrogate alpha 课程
+    set_alpha_with_warmup(model, args.alpha, epoch, args.epochs, args.alpha_warmup)
+    train()
     val_metric, test_metric = test(val_loader), test(test_loader)
     if val_metric[1] > best_val_metric:
         best_val_metric = val_metric[1]
@@ -342,10 +328,8 @@ for epoch in range(1, args.epochs + 1):
     end = time.time()
     print(
         f'Epoch: {epoch:03d}, Val: {val_metric[1]:.4f}, Test: {test_metric[1]:.4f}, '
-        f'Best: Macro-{best_test_metric[0]:.4f}, Micro-{best_test_metric[1]:.4f}, '
-        f'CE: {train_stats["ce_loss"]:.4f}, Spike: {train_stats["spike_reg"]:.6f}, '
-        f'Temp: {train_stats["temp_reg"]:.6f}, Time: {end-start:.2f}s')
+        f'Best: Macro-{best_test_metric[0]:.4f}, Micro-{best_test_metric[1]:.4f}, Time elapsed {end-start:.2f}s')
 
-# save binary node embeddings (spikes)
-# emb = model.encode(torch.arange(data.num_nodes)).cpu()
-# torch.save(emb, 'emb.pth')
+# # 如需保存二进制脉冲表示（spikes）
+# # emb = model.encode(torch.arange(data.num_nodes)).cpu()
+# # torch.save(emb, 'emb.pth')

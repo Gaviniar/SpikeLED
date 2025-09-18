@@ -1,43 +1,26 @@
+# File: spikenet/gates.py
 import torch
 import torch.nn as nn
 
-
 class L2SGate(nn.Module):
     """
-    可学习时序-结构采样门（L2S-Gate）
-    根据当前时间片统计自动分配历史vs当前的采样比例
+    Learnable Local 2-source Sampling Gate（按层的极轻量门控），不对采样操作反传。
+    输入: stats_t ∈ R^F（如: [新增边占比, 平均度]），输出: p_{l,t} ∈ (0,1) 每层一个。
     """
-    def __init__(self, input_dim=3, hidden_dim=8):
+    def __init__(self, num_layers: int, in_features: int = 2, base_p: float = 0.5):
         super().__init__()
-        self.gate_net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, temporal_stats):
-        """
-        Args:
-            temporal_stats: [3] tensor with [edge_growth, avg_degree, activity]
-        Returns:
-            p_t: scalar in [0,1] for sampling allocation
-        """
-        return self.gate_net(temporal_stats)
+        self.num_layers = num_layers
+        self.base_p = base_p
+        # 每层一组 (w, b)
+        self.w = nn.Parameter(torch.zeros(num_layers, in_features))
+        self.b = nn.Parameter(torch.zeros(num_layers))
 
-
-class AdaptiveThreshold(nn.Module):
-    """自适应阈值参数（SCAT的一部分）"""
-    def __init__(self, init_gamma=0.2, init_thresh_decay=0.7):
-        super().__init__()
-        # 用sigmoid约束在(0,1)
-        self.gamma_logit = nn.Parameter(torch.logit(torch.tensor(init_gamma)))
-        self.thresh_decay_logit = nn.Parameter(torch.logit(torch.tensor(init_thresh_decay)))
-    
-    @property
-    def gamma(self):
-        return torch.sigmoid(self.gamma_logit)
-    
-    @property    
-    def thresh_decay(self):
-        return torch.sigmoid(self.thresh_decay_logit)
+    @torch.no_grad()
+    def forward(self, stats_t: torch.Tensor) -> torch.Tensor:
+        # stats_t: [F]（建议放 CPU/GPU 均可，这里不求梯度）
+        z = stats_t.float().view(-1)  # [F]
+        logits = torch.mv(self.w, z) + self.b  # [L]
+        p = torch.sigmoid(logits)              # (0,1)
+        # 与 base_p 做一个温和融合，避免训练前期剧烈波动
+        p = 0.5 * p + 0.5 * torch.as_tensor(self.base_p).to(p)
+        return p  # [L]

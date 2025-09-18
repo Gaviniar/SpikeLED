@@ -3,9 +3,8 @@ from math import pi
 import torch
 import torch.nn as nn
 
-# 将全局常量改为可学习参数的默认值
-DEFAULT_GAMMA = 0.2
-DEFAULT_THRESH_DECAY = 0.7
+gamma = 0.2
+thresh_decay = 0.7
 
 
 def reset_net(net: nn.Module):
@@ -144,21 +143,13 @@ SURROGATE = {'sigmoid': sigmoidspike, 'triangle': trianglespike, 'arctan': arcta
 
 
 class IF(nn.Module):
-    def __init__(self, v_threshold=1.0, v_reset=0., alpha=1.0, surrogate='triangle', 
-                 learnable_threshold=False):
+    def __init__(self, v_threshold=1.0, v_reset=0., alpha=1.0, surrogate='triangle'):
         super().__init__()
         self.v_threshold = v_threshold
         self.v_reset = v_reset
         self.surrogate = SURROGATE.get(surrogate)
-        self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
-        
-        # 可学习阈值参数
-        if learnable_threshold:
-            from .gates import AdaptiveThreshold
-            self.adaptive_thresh = AdaptiveThreshold()
-        else:
-            self.adaptive_thresh = None
-            
+        self.register_buffer("alpha", torch.as_tensor(
+            alpha, dtype=torch.float32))
         self.reset()
 
     def reset(self):
@@ -172,35 +163,21 @@ class IF(nn.Module):
         spike = self.surrogate(self.v, self.v_threshold, self.alpha)
         # 3. reset
         self.v = (1 - spike) * self.v + spike * self.v_reset
-        # 4. threshold updates with learnable parameters
-        if self.adaptive_thresh is not None:
-            gamma = self.adaptive_thresh.gamma
-            thresh_decay = self.adaptive_thresh.thresh_decay
-        else:
-            gamma = DEFAULT_GAMMA
-            thresh_decay = DEFAULT_THRESH_DECAY
-            
+        # 4. threhold updates
+        # Calculate change in cell's threshold based on a fixed decay factor and incoming spikes.
         self.v_th = gamma * spike + self.v_th * thresh_decay
         return spike
 
 
 class LIF(nn.Module):
-    def __init__(self, tau=1.0, v_threshold=1.0, v_reset=0., alpha=1.0, surrogate='triangle',
-                 learnable_threshold=False):
+    def __init__(self, tau=1.0, v_threshold=1.0, v_reset=0., alpha=1.0, surrogate='triangle'):
         super().__init__()
         self.v_threshold = v_threshold
         self.v_reset = v_reset
         self.surrogate = SURROGATE.get(surrogate)
         self.register_buffer("tau", torch.as_tensor(tau, dtype=torch.float32))
-        self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
-        
-        # 可学习阈值参数
-        if learnable_threshold:
-            from .gates import AdaptiveThreshold
-            self.adaptive_thresh = AdaptiveThreshold()
-        else:
-            self.adaptive_thresh = None
-            
+        self.register_buffer("alpha", torch.as_tensor(
+            alpha, dtype=torch.float32))
         self.reset()
 
     def reset(self):
@@ -214,35 +191,22 @@ class LIF(nn.Module):
         spike = self.surrogate(self.v, self.v_th, self.alpha)
         # 3. reset
         self.v = (1 - spike) * self.v + spike * self.v_reset
-        # 4. threshold updates with learnable parameters
-        if self.adaptive_thresh is not None:
-            gamma = self.adaptive_thresh.gamma
-            thresh_decay = self.adaptive_thresh.thresh_decay
-        else:
-            gamma = DEFAULT_GAMMA
-            thresh_decay = DEFAULT_THRESH_DECAY
-            
+        # 4. threhold updates
+        # Calculate change in cell's threshold based on a fixed decay factor and incoming spikes.
         self.v_th = gamma * spike + self.v_th * thresh_decay
         return spike
 
 
 class PLIF(nn.Module):
-    def __init__(self, tau=1.0, v_threshold=1.0, v_reset=0., alpha=1.0, surrogate='triangle',
-                 learnable_threshold=False):
+    def __init__(self, tau=1.0, v_threshold=1.0, v_reset=0., alpha=1.0, surrogate='triangle'):
         super().__init__()
         self.v_threshold = v_threshold
         self.v_reset = v_reset
         self.surrogate = SURROGATE.get(surrogate)
-        self.register_parameter("tau", nn.Parameter(torch.as_tensor(tau, dtype=torch.float32)))
-        self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
-        
-        # 可学习阈值参数
-        if learnable_threshold:
-            from .gates import AdaptiveThreshold
-            self.adaptive_thresh = AdaptiveThreshold()
-        else:
-            self.adaptive_thresh = None
-            
+        self.register_parameter("tau", nn.Parameter(
+            torch.as_tensor(tau, dtype=torch.float32)))
+        self.register_buffer("alpha", torch.as_tensor(
+            alpha, dtype=torch.float32))
         self.reset()
 
     def reset(self):
@@ -256,13 +220,7 @@ class PLIF(nn.Module):
         spike = self.surrogate(self.v, self.v_th, self.alpha)
         # 3. reset
         self.v = (1 - spike) * self.v + spike * self.v_reset
-        # 4. threshold updates with learnable parameters
-        if self.adaptive_thresh is not None:
-            gamma = self.adaptive_thresh.gamma
-            thresh_decay = self.adaptive_thresh.thresh_decay
-        else:
-            gamma = DEFAULT_GAMMA
-            thresh_decay = DEFAULT_THRESH_DECAY
-            
+        # 4. threhold updates
+        # Calculate change in cell's threshold based on a fixed decay factor and incoming spikes.
         self.v_th = gamma * spike + self.v_th * thresh_decay
         return spike
