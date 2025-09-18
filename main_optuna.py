@@ -310,9 +310,11 @@ def objective_factory(args):
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"])
         loss_fn = nn.CrossEntropyLoss()
 
-        # 依据 trial 的 batch_size 构建 Loader
-        nonlocal train_loader, val_loader, test_loader
         train_loader, val_loader, test_loader = make_loaders(cfg["batch_size"])
+
+        best_val_micro = -1.0
+        best_test_macro = 0.0
+        best_test_micro = 0.0
 
         best_val_micro = -1.0
         best_test_macro = 0.0
