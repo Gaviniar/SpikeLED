@@ -2,45 +2,60 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# --- replace this class in spikenet/temporal.py ---
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class GroupSparseDelay1D(nn.Module):
     """
-    组共享 + 稀疏离散延迟核（仅沿时间维做 depthwise 1D 卷积的等价移位加权）
+    组共享 + 稀疏离散延迟核（支持任意 D、groups，不要求整除）
     输入: x [B, T, D] ；输出: y [B, T, D]
-    复杂度：O(G * |delays| * B * T * (D/G))，D>>G 且 |delays|<<T
     """
     def __init__(self, D: int, T: int, groups: int = 8, delays=(1, 3, 5)):
         super().__init__()
-        assert D % groups == 0, "D must be divisible by groups"
-        self.D, self.T, self.G = D, T, groups
-        self.delays = list(sorted(set(int(d) for d in delays if d >= 1)))
-        g = groups
-        k = len(self.delays)
-        # 每组对每个 delay 一个权重（共享到组内所有通道）
-        self.weight = nn.Parameter(torch.zeros(g, k))
+        self.D, self.T = int(D), int(T)
+        self.G = max(1, int(groups))
+        # 延迟集合
+        self.delays = [int(d) for d in delays if int(d) >= 1]
+        if len(self.delays) == 0:
+            raise ValueError("`delays` must contain at least one positive integer.")
+
+        # 每组一套 delay 权重（共享到被分配到该组的所有通道）
+        self.weight = nn.Parameter(torch.zeros(self.G, len(self.delays)))
+
+        # 通道 -> 组 的映射（不要求均匀整除，采用 round-robin 分配）
+        ch2g = torch.arange(self.D, dtype=torch.long) % self.G
+        self.register_buffer("ch2g", ch2g)
+
         self.reset_parameters()
 
     def reset_parameters(self):
-        # 小幅正值初始化，利于稳定起步
         nn.init.normal_(self.weight, mean=0.01, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, D]
         B, T, D = x.shape
-        assert T == self.T and D == self.D
-        gC = D // self.G
-        xg = x.view(B, T, self.G, gC).permute(0, 2, 1, 3)  # [B, G, T, gC]
+        if T != self.T or D != self.D:
+            raise ValueError(f"Input has shape [B,{T},{D}], but module was built with T={self.T}, D={self.D}")
 
-        # 组共享稀疏核：y_t = sum_d softmax(w_g)[d] * x_{t-d}
-        W = self.weight.softmax(dim=-1)  # [G, K]
+        # 计算每通道的延迟权重：Wg[G,K] -> Wc[D,K]
+        Wg = self.weight.softmax(dim=-1)        # [G, K]
+        Wc = Wg.index_select(0, self.ch2g)      # [D, K]
+
+        # 构造按时间维的移位堆栈: xs -> [B, T, D, K]
         xs = []
         for d in self.delays:
-            # 左 pad d，再截断到长度 T，实现 x_{t-d}
-            shifted = F.pad(xg, (0, 0, d, 0))[:, :, :T, :]  # [B,G,T,gC]
-            xs.append(shifted.unsqueeze(2))  # [B,G,1,T,gC]
-        Xstk = torch.cat(xs, dim=2)  # [B,G,K,T,gC]
-        y = (W.view(1, self.G, -1, 1, 1) * Xstk).sum(dim=2)  # [B,G,T,gC]
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, D)  # [B,T,D]
+            # 在时间维(=1)左侧 pad d，实现 x_{t-d}
+            shifted = F.pad(x, (0, 0, d, 0))[:, :T, :]   # [B, T, D]
+            xs.append(shifted.unsqueeze(-1))             # [B, T, D, 1]
+        Xstk = torch.cat(xs, dim=-1)                     # [B, T, D, K]
+
+        # 通道共享权重按组广播并聚合
+        y = (Xstk * Wc.view(1, 1, D, -1)).sum(dim=-1)    # [B, T, D]
         return y
+
 
 
 class TemporalSeparableReadout(nn.Module):
