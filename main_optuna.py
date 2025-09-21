@@ -236,10 +236,10 @@ def make_loaders(batch_size: int):
 
 # ========================= Optuna 目标函数 =========================
 def build_model_from_trial(trial, in_features, out_features):
-    # 层数（保证 len(hids) == len(sizes)）
+    # 层数
     n_layers = trial.suggest_int("n_layers", 2, 3)
 
-    # 每层采样邻居数
+    # 每层采样邻居数（保持参数名稳定）
     sizes = []
     for i in range(n_layers):
         if i == 0:
@@ -247,10 +247,10 @@ def build_model_from_trial(trial, in_features, out_features):
         else:
             sizes.append(trial.suggest_int(f"size_l{i}", 2, 10))
 
-    # ——固定隐藏维度：128——
+    # 固定隐藏维度
     hids = [128] * n_layers
 
-    # 其它超参（categorical 一律 tuple）
+    # 其它超参（choices 全是标量）
     dropout = trial.suggest_float("dropout", 0.3, 0.8)
     lr = trial.suggest_float("lr", 1e-5, 5e-2, log=True)
     alpha = trial.suggest_float("alpha", 0.5, 2.0)
@@ -264,43 +264,54 @@ def build_model_from_trial(trial, in_features, out_features):
     concat = trial.suggest_categorical("concat", (False, True))
 
     use_learnable_p = trial.suggest_categorical("use_learnable_p", (True, False))
-    use_gs_delay = trial.suggest_categorical("use_gs_delay", (True, False))
-    use_tsr = trial.suggest_categorical("use_tsr", (True, False))
+    use_gs_delay   = trial.suggest_categorical("use_gs_delay", (True, False))
+    use_tsr        = trial.suggest_categorical("use_tsr", (True, False))
 
-    # 条件参数 - 只有在 use_gs_delay 为 True 时才进行搜索
-    if use_gs_delay:
-        delay_groups = trial.suggest_int("delay_groups", 4, 16)
-        delays_choice = trial.suggest_categorical(
-            "delays",
-            ((0, 1, 2), (0, 1, 3, 5), (1, 3, 5))
-        )
-    else:
-        delay_groups = 8  
-        delays_choice = (1, 3, 5)  
+    # === 关键改动 1：始终 suggest（避免动态空间） ===
+    delay_groups_suggested = trial.suggest_int("delay_groups", 4, 16)
 
+    # === 关键改动 2：choices 只用“标量 id”，再映射到 tuple ===
+    #   0 -> (0,1,2), 1 -> (0,1,3,5), 2 -> (1,3,5)
+    delay_set_id = trial.suggest_categorical("delay_set_id_v3", (0, 1, 2))
+    DELAY_SETS = {
+        0: (0, 1, 2),
+        1: (0, 1, 3, 5),
+        2: (1, 3, 5),
+    }
+    delay_set_suggested = DELAY_SETS[int(delay_set_id)]
 
-    # 正则相关
+    # 未启用时使用固定有效值，但搜索空间保持不变
+    delay_groups_eff = delay_groups_suggested if use_gs_delay else 8
+    delay_set_eff    = delay_set_suggested   if use_gs_delay else (1, 3, 5)
+
+    # 正则
     spike_reg = trial.suggest_categorical("spike_reg", (0.0, 1e-5, 1e-4, 5e-4, 1e-3))
-    temp_reg = trial.suggest_categorical("temp_reg", (0.0, 1e-6, 5e-6, 1e-5, 5e-5))
+    temp_reg  = trial.suggest_categorical("temp_reg",  (0.0, 1e-6, 5e-6, 1e-5, 5e-5))
 
     batch_size = 1024
 
-    model = SpikeNet(in_features, out_features,
-                     hids=hids, alpha=alpha, p=p,
-                     dropout=dropout, bias=True, aggr=aggr, sampler=sampler,
-                     surrogate=surrogate, sizes=sizes, concat=concat, act=neuron_type,
-                     use_gs_delay=use_gs_delay, delay_groups=delay_groups, delay_set=delays_choice,
-                     use_learnable_p=use_learnable_p, use_tsr=use_tsr).to(device)
+    model = SpikeNet(
+        in_features, out_features,
+        hids=hids, alpha=alpha, p=p,
+        dropout=dropout, bias=True, aggr=aggr, sampler=sampler,
+        surrogate=surrogate, sizes=sizes, concat=concat, act=neuron_type,
+        use_gs_delay=use_gs_delay,
+        delay_groups=delay_groups_eff,
+        delay_set=delay_set_eff,
+        use_learnable_p=use_learnable_p, use_tsr=use_tsr
+    ).to(device)
 
-    # 可选：把条件开关记到面板（不影响优化）
+    # 记录“有效值”到 dashboard
     trial.set_user_attr("gs_delay_enabled", bool(use_gs_delay))
-    if use_gs_delay:
-        trial.set_user_attr("delay_groups", int(delay_groups))
-        trial.set_user_attr("delays", tuple(delays_choice))
+    trial.set_user_attr("delay_groups_eff", int(delay_groups_eff))
+    trial.set_user_attr("delay_set_eff", tuple(delay_set_eff))
 
-    cfg = dict(lr=lr, alpha=alpha, alpha_warmup=alpha_warmup,
-               spike_reg=spike_reg, temp_reg=temp_reg, batch_size=batch_size)
+    cfg = dict(
+        lr=lr, alpha=alpha, alpha_warmup=alpha_warmup,
+        spike_reg=spike_reg, temp_reg=temp_reg, batch_size=batch_size
+    )
     return model, cfg
+
 
 
 def objective_factory(args):
