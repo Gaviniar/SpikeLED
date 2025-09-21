@@ -1,10 +1,8 @@
 # File: main_optuna.py
 import argparse
-import json
-import os
 import time
 import warnings
-from typing import Tuple, List, Optional
+from typing import Tuple
 
 import optuna
 from optuna.trial import TrialState
@@ -249,13 +247,10 @@ def build_model_from_trial(trial, in_features, out_features):
         else:
             sizes.append(trial.suggest_int(f"size_l{i}", 2, 10))
 
-    # 每层隐藏维度
-    hids = []
-    for i in range(n_layers):
-        low, high = (64, 256) if i == 0 else (16, 128)
-        hids.append(trial.suggest_int(f"hid_l{i}", low, high))
+    # ——固定隐藏维度：128——
+    hids = [128] * n_layers
 
-    # 其它超参
+    # 其它超参（categorical 一律 tuple）
     dropout = trial.suggest_float("dropout", 0.3, 0.8)
     lr = trial.suggest_float("lr", 1e-5, 5e-2, log=True)
     alpha = trial.suggest_float("alpha", 0.5, 2.0)
@@ -272,19 +267,23 @@ def build_model_from_trial(trial, in_features, out_features):
     use_gs_delay = trial.suggest_categorical("use_gs_delay", (True, False))
     use_tsr = trial.suggest_categorical("use_tsr", (True, False))
 
-    # Delay 相关（choices 一律 tuple，避免 Dashboard 哈希报错）
-    delay_groups = trial.suggest_int("delay_groups", 4, 16) if use_gs_delay else 8
-    delays_choice = trial.suggest_categorical(
-        "delays",
-        ((0, 1, 2), (0, 1, 3, 5), (1, 3, 5))
-    ) if use_gs_delay else (1, 3, 5)
+    # 条件参数 - 只有在 use_gs_delay 为 True 时才进行搜索
+    if use_gs_delay:
+        delay_groups = trial.suggest_int("delay_groups", 4, 16)
+        delays_choice = trial.suggest_categorical(
+            "delays",
+            ((0, 1, 2), (0, 1, 3, 5), (1, 3, 5))
+        )
+    else:
+        delay_groups = 8  
+        delays_choice = (1, 3, 5)  
+
 
     # 正则相关
     spike_reg = trial.suggest_categorical("spike_reg", (0.0, 1e-5, 1e-4, 5e-4, 1e-3))
     temp_reg = trial.suggest_categorical("temp_reg", (0.0, 1e-6, 5e-6, 1e-5, 5e-5))
 
     batch_size = 1024
-    # trial.suggest_categorical("batch_size", (512, 1024, 2048))
 
     model = SpikeNet(in_features, out_features,
                      hids=hids, alpha=alpha, p=p,
@@ -315,7 +314,7 @@ def objective_factory(args):
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"])
         loss_fn = nn.CrossEntropyLoss()
 
-        # 局部 loader（不需要 nonlocal）
+        # 局部 loader
         train_loader, val_loader, test_loader = make_loaders(cfg["batch_size"])
 
         best_val_micro = -1.0
@@ -334,7 +333,7 @@ def objective_factory(args):
             # 向 Optuna 汇报中间结果，并用于裁剪
             trial.report(val_micro, step=epoch)
 
-            # 保存最好验证对应的测试指标（便于面板查看）
+            # 保存最好验证对应的测试指标
             if val_micro > best_val_micro:
                 best_val_micro = val_micro
                 best_test_macro = test_macro
@@ -365,7 +364,7 @@ def parse_args():
     # 数据与拆分
     p.add_argument("--dataset", default="DBLP", help="DBLP | Tmall | Patent")
     p.add_argument("--root", default="/data4/zhengzhuoyu/data")
-    p.add_argument("--train_size", type=float, default=0.35, help="与 main.py 对齐：会再留 0.05 做 val。")
+    p.add_argument("--train_size", type=float, default=0.8)
     p.add_argument("--val_size", type=float, default=0.05)
     p.add_argument("--split_seed", type=int, default=42)
     p.add_argument("--seed", type=int, default=2022)
@@ -374,8 +373,9 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=60)
 
     # Optuna
-    p.add_argument("--study", default="SpikeNet-HPO")
-    p.add_argument("--storage", default="sqlite:///spikenet_optuna.db",
+    # 用新名字避免旧 Study（含 list choices）影响 Dashboard
+    p.add_argument("--study", default="SpikeNet-HPO-v3")
+    p.add_argument("--storage", default="sqlite:///s_optuna.db",
                    help="sqlite:///file.db 或 mysql://user:pwd@host/db 等")
     p.add_argument("--n-trials", type=int, default=100)
     p.add_argument("--timeout", type=int, default=None)
