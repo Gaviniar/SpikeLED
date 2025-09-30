@@ -288,7 +288,7 @@ def build_model_from_trial(trial, in_features, out_features):
     spike_reg = trial.suggest_categorical("spike_reg", (0.0, 1e-5, 1e-4, 5e-4, 1e-3))
     temp_reg  = trial.suggest_categorical("temp_reg",  (0.0, 1e-6, 5e-6, 1e-5, 5e-5))
 
-    batch_size = 1024
+    batch_size = 512
 
     model = SpikeNet(
         in_features, out_features,
